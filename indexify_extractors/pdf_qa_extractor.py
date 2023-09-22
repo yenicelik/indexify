@@ -1,3 +1,12 @@
+# ! apt install tesseract-ocr
+# ! apt install libtesseract-dev
+
+# ! pip install transformers
+# ! pip install torch torchvision
+# ! pip install Pillow
+# ! pip install pytesseract
+# import pytesseract
+
 from transformers import LayoutLMv2ForQuestionAnswering, LayoutLMv2Tokenizer
 from PIL import Image
 import torch
@@ -5,30 +14,29 @@ import json
 from typing import List, Any, Union
 from .base_extractor import Extractor, ExtractorInfo, Content, ExtractedAttributes, ExtractedEmbedding
 from pydantic import BaseModel
+from transformers import pipeline
 
 class QuestionAnsweringInputParams(BaseModel):
     question: str
 
 class InvoiceQA(Extractor):
     def __init__(self):
-        self.model_name = "microsoft/layoutlmv2-base-uncased"
-        self.tokenizer = LayoutLMv2Tokenizer.from_pretrained(self.model_name)
-        self.model = LayoutLMv2ForQuestionAnswering.from_pretrained(self.model_name)
-
+        # Keep it stupid simple, only use a standard pipeline for now, instead of fancy models
+        # TODO: We can probably run multiple models, to get uncertainty estimates. Expensive, but could be worth it. 
+        self.model = pipeline(
+            "document-question-answering",
+            model="impira/layoutlm-document-qa",
+        )
+        self.top_k = 5
+        
     def answer_question(self, question: str, image_path: str):
-        image = Image.open(image_path)
-        encoding = self.tokenizer(question, images=image, padding=True, truncation=True, return_tensors="pt")
-        input_ids = encoding["input_ids"]
-        attention_mask = encoding["attention_mask"]
-        token_type_ids = encoding["token_type_ids"]
-
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        start_logits = outputs.start_logits
-        end_logits = outputs.end_logits
-
-        all_tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
-        answer = ' '.join(all_tokens[torch.argmax(start_logits) : torch.argmax(end_logits)+1])
-        return answer
+        return self.model(
+            image_path,
+            question,
+            # maximum number of characters of the question you can pose, the shorter the better
+            max_question_len=128,
+            top_k=self.top_k
+        )
 
     def extract(self, content: List[Content], params: dict[str, Any]) -> List[Union[ExtractedEmbedding, ExtractedAttributes]]:
         extracted_data = []
@@ -38,7 +46,8 @@ class InvoiceQA(Extractor):
         return extracted_data
 
     def info(self) -> ExtractorInfo:
-        schema = {"answer": "string"}
+        # TODO: How do i denote a list; are number-type names correct?
+        schema = {"answer": "string", "score": "float", "start": "integer", "end": "integer"}
         schema_json = json.dumps(schema)
         return ExtractorInfo(
             name="InvoiceQA",
