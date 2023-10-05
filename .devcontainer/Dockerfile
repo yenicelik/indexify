@@ -10,6 +10,9 @@ RUN apt update
 
 RUN apt -y install python3.11 python3.11-dev python3.11-venv sqlite3 pip virtualenv
 RUN apt -y install protobuf-compiler protobuf-compiler-grpc
-RUN apt -y install ca-certificates curl gnupg pkg-config libssl-dev vim
+RUN apt -y install ca-certificates curl gnupg pkg-config libssl-dev vim libffi-dev
+
+RUN curl -o /usr/local/bin/cog -L https://github.com/replicate/cog/releases/latest/download/cog_`uname -s`_`uname -m`
+RUN chmod +x /usr/local/bin/cog
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
