@@ -5,6 +5,7 @@ use opentelemetry::global;
 use opentelemetry::sdk::Resource;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::filter::LevelFilter;
 use std::sync::Arc;
 use tracing::{debug, info};
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
@@ -46,7 +47,9 @@ fn initialize_otlp_tracer(
     http_endpoint: Option<String>,
     trace_id_ratio: f64,
 ) -> Result<(), Error> {
-    let filter = EnvFilter::from_default_env();
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
     match http_endpoint {
         Some(http_endpoint) => {
             let stdout_layer = tracing_subscriber::fmt::layer();
@@ -104,8 +107,6 @@ async fn main() -> Result<(), Error> {
             config_path,
             dev_mode,
         } => {
-            info!("starting indexify server....");
-            info!("version: {}", version);
             let config = indexify::ServerConfig::from_path(&config_path)?;
             let service_name = if dev_mode {
                 "indexify.api_server_dev".to_string()
@@ -117,6 +118,8 @@ async fn main() -> Result<(), Error> {
                 config.otlp_http_collector.clone(),
                 config.trace_id_ratio,
             )?;
+            info!("starting indexify server....");
+            info!("version: {}", version);
             debug!("Server config is: {:?}", config);
             let server = indexify::Server::new(Arc::new(config.clone()))?;
             let server_handle = tokio::spawn(async move {
