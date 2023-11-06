@@ -1,0 +1,12 @@
+name: diptanu/full-pdf-extractor
+version: 1
+module: pdf_raw_text_extractor.PdfRawTextExtractor
+gpu: true
+python_dependencies:
+  - git+https://github.com/facebookresearch/detectron2.git
+  - deepdoctection[pt]
+  - tf2onnx
+system_dependencies:
+  - tesseract-ocr
+  - libtesseract-dev
+  - tesseract-ocr-deu
