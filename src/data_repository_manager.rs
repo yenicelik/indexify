@@ -1,7 +1,12 @@
 use anyhow::Result;
 use bytes::Bytes;
+use itertools::Itertools;
 use sea_orm::DbConn;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -13,10 +18,10 @@ use crate::{
     index::IndexError,
     persistence::{
         ContentPayload, DataRepository, Event, ExtractedAttributes, ExtractorBinding,
-        ExtractorConfig, ExtractorOutputSchema, Index, Repository, RepositoryError,
+        ExtractorDescription, ExtractorOutputSchema, Index, Repository, RepositoryError,
     },
+    server_config::ServerConfig,
     vector_index::{ScoredText, VectorIndexManager},
-    ServerConfig,
 };
 
 #[derive(Error, Debug)]
@@ -32,6 +37,9 @@ pub enum DataRepositoryError {
 
     #[error("operation not allowed: `{0}`")]
     NotAllowed(String),
+
+    #[error("output name `{0}` not found in extractor")]
+    OutputNameNotFound(String),
 }
 
 pub struct DataRepositoryManager {
@@ -39,6 +47,12 @@ pub struct DataRepositoryManager {
     vector_index_manager: Arc<VectorIndexManager>,
     attribute_index_manager: Arc<AttributeIndexManager>,
     blob_storage: BlobStorageTS,
+}
+
+impl fmt::Debug for DataRepositoryManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataRepositoryManager").finish()
+    }
 }
 
 impl DataRepositoryManager {
@@ -72,6 +86,7 @@ impl DataRepositoryManager {
         }
     }
 
+    #[tracing::instrument]
     pub async fn create_default_repository(
         &self,
         _server_config: &ServerConfig,
@@ -93,6 +108,7 @@ impl DataRepositoryManager {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn list_repositories(&self) -> Result<Vec<DataRepository>, DataRepositoryError> {
         self.repository
             .repositories()
@@ -100,6 +116,7 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::Persistence)
     }
 
+    #[tracing::instrument]
     async fn create_index(
         &self,
         repository: &str,
@@ -109,25 +126,41 @@ impl DataRepositoryManager {
             .repository
             .extractor_by_name(&extractor_binding.extractor_name)
             .await?;
+        for (feature_name, index_name) in extractor_binding.indexes.bindings().clone() {
+            let extractor_output_schema = extractor
+                .schemas
+                .outputs
+                .get(&feature_name)
+                .ok_or_else(|| DataRepositoryError::OutputNameNotFound(feature_name))?;
 
-        match extractor.output_schema.clone() {
-            ExtractorOutputSchema::Embedding { .. } => {
-                self.vector_index_manager
-                    .create_index(repository, &extractor_binding.index_name, extractor.clone())
-                    .await
-                    .map_err(|e| DataRepositoryError::IndexCreation(e.to_string()))?;
-            }
-            ExtractorOutputSchema::Attributes { .. } => {
-                self.attribute_index_manager
-                    .create_index(repository, &extractor_binding.index_name, extractor.clone())
-                    .await
-                    .map_err(|e| DataRepositoryError::IndexCreation(e.to_string()))?;
-            }
-        };
-
+            match extractor_output_schema.clone() {
+                ExtractorOutputSchema::Embedding {
+                    dim,
+                    distance_metric,
+                } => {
+                    self.vector_index_manager
+                        .create_index(
+                            repository,
+                            &index_name,
+                            extractor.clone(),
+                            distance_metric,
+                            dim,
+                        )
+                        .await
+                        .map_err(|e| DataRepositoryError::IndexCreation(e.to_string()))?;
+                }
+                ExtractorOutputSchema::Attributes { .. } => {
+                    self.attribute_index_manager
+                        .create_index(repository, &index_name, extractor.clone())
+                        .await
+                        .map_err(|e| DataRepositoryError::IndexCreation(e.to_string()))?;
+                }
+            };
+        }
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn create(&self, repository: &DataRepository) -> Result<(), DataRepositoryError> {
         info!("creating data repository: {}", repository.name);
         self.repository
@@ -143,6 +176,7 @@ impl DataRepositoryManager {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn get(&self, name: &str) -> Result<DataRepository, DataRepositoryError> {
         self.repository
             .repository_by_name(name)
@@ -150,14 +184,15 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::Persistence)
     }
 
+    #[tracing::instrument]
     pub async fn add_extractor_binding(
         &self,
         repository: &str,
         extractor: ExtractorBinding,
     ) -> Result<(), DataRepositoryError> {
         info!(
-            "adding extractor binding: repository: {}, extractor: {}, index: {}",
-            repository, extractor.extractor_name, extractor.index_name
+            "adding extractor bindings repository: {}, extractor: {}, index: {}",
+            repository, extractor.extractor_name, extractor.indexes,
         );
         self.create_index(repository, &extractor).await?;
         let mut data_repository = self
@@ -166,18 +201,21 @@ impl DataRepositoryManager {
             .await
             .unwrap();
         for ex in &data_repository.extractor_bindings {
-            if extractor.index_name == ex.index_name {
-                return Err(DataRepositoryError::NotAllowed(format!(
-                    "index with name `{}` already exists",
-                    extractor.index_name,
-                )));
-            }
+            let index_names: HashSet<String> = ex.indexes.index_names().into_iter().collect();
+            let new_index_names: HashSet<String> =
+                extractor.indexes.index_names().into_iter().collect();
+            let mut common_names = index_names.intersection(&new_index_names);
+            return Err(DataRepositoryError::NotAllowed(format!(
+                "index with names `{}` already exists",
+                common_names.join(",")
+            )));
         }
         data_repository.extractor_bindings.push(extractor.clone());
         self.repository.upsert_repository(data_repository).await?;
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn add_texts(
         &self,
         repo_name: &str,
@@ -190,6 +228,7 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::Persistence)
     }
 
+    #[tracing::instrument]
     pub async fn list_indexes(
         &self,
         repository_name: &str,
@@ -202,6 +241,7 @@ impl DataRepositoryManager {
         Ok(indexes)
     }
 
+    #[tracing::instrument]
     pub async fn search(
         &self,
         repository: &str,
@@ -215,6 +255,7 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::RetrievalError)
     }
 
+    #[tracing::instrument]
     pub async fn attribute_lookup(
         &self,
         repository: &str,
@@ -226,7 +267,8 @@ impl DataRepositoryManager {
             .await
     }
 
-    pub async fn list_extractors(&self) -> Result<Vec<ExtractorConfig>, DataRepositoryError> {
+    #[tracing::instrument]
+    pub async fn list_extractors(&self) -> Result<Vec<ExtractorDescription>, DataRepositoryError> {
         let extractors = self
             .repository
             .list_extractors()
@@ -235,6 +277,7 @@ impl DataRepositoryManager {
         Ok(extractors)
     }
 
+    #[tracing::instrument]
     pub async fn add_events(
         &self,
         repository: &str,
@@ -246,6 +289,7 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::Persistence)
     }
 
+    #[tracing::instrument]
     pub async fn list_events(&self, repository: &str) -> Result<Vec<Event>, DataRepositoryError> {
         self.repository
             .list_events(repository)
@@ -253,6 +297,7 @@ impl DataRepositoryManager {
             .map_err(DataRepositoryError::Persistence)
     }
 
+    #[tracing::instrument]
     pub async fn upload_file(
         &self,
         repository: &str,
@@ -281,7 +326,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::blob_storage::BlobStorageBuilder;
-    use crate::persistence::{DataConnector, Event, ExtractorBinding, SourceType};
+    use crate::persistence::{DataConnector, Event, ExtractorBinding, IndexBindings, SourceType};
     use crate::test_util;
     use crate::test_util::db_utils::{DEFAULT_TEST_EXTRACTOR, DEFAULT_TEST_REPOSITORY};
 
@@ -305,7 +350,7 @@ mod tests {
             extractor_bindings: vec![ExtractorBinding::new(
                 "test",
                 DEFAULT_TEST_EXTRACTOR.to_string(),
-                "default_embedder".to_string(),
+                IndexBindings::from_feature("embedding"),
                 vec![],
                 serde_json::json!({}),
             )],

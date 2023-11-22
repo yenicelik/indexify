@@ -3,17 +3,21 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use sea_orm::FromQueryResult;
+use sea_orm::{DatabaseConnection, FromQueryResult};
 use serde::{Deserialize, Serialize};
 use strum_macros::{Display, EnumString};
 use thiserror::Error;
 
-use crate::VectorIndexConfig;
+use crate::server_config::{IndexStoreKind, VectorIndexConfig};
 
-pub mod pg_embedding;
+pub mod open_search;
+pub mod pg_vector;
 pub mod qdrant;
 
 use qdrant::QdrantDb;
+
+use self::open_search::OpenSearchKnn;
+use self::pg_vector::PgVector;
 
 #[derive(Display, Debug, Clone, EnumString, Serialize, Deserialize)]
 pub enum IndexDistance {
@@ -31,7 +35,7 @@ pub enum IndexDistance {
 }
 
 /// A request to create a new vector index in the vector database.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CreateIndexParams {
     pub vectordb_index_name: String,
     pub vector_dim: u64,
@@ -50,22 +54,19 @@ pub struct SearchResult {
 #[derive(Error, Debug)]
 pub enum VectorDbError {
     #[error("collection `{0}` has not been deleted: `{1}`")]
-    IndexDeletionError(String, String),
-
-    #[error("config not present")]
-    ConfigNotPresent,
+    IndexNotDeleted(String, String),
 
     #[error("error creating index: `{0}`")]
-    IndexCreationError(String),
+    IndexNotCreated(String),
 
     #[error("internal error: `{0}")]
-    InternalError(String),
+    Internal(String),
 
     #[error("error writing to index: `{0}`")]
-    IndexWriteError(String),
+    IndexNotWritten(String),
 
     #[error("error reading from index: `{0}`")]
-    IndexReadError(String),
+    IndexNotRead(String),
 }
 
 pub type VectorDBTS = Arc<dyn VectorDb + Sync + Send>;
@@ -117,8 +118,18 @@ pub trait VectorDb {
 }
 
 /// Creates a new vector database based on the specified configuration.
-pub fn create_vectordb(config: VectorIndexConfig) -> Result<VectorDBTS, VectorDbError> {
+pub fn create_vectordb(
+    config: VectorIndexConfig,
+    postgres_db_conn: DatabaseConnection,
+) -> Result<VectorDBTS, VectorDbError> {
     match config.index_store {
-        crate::IndexStoreKind::Qdrant => Ok(Arc::new(QdrantDb::new(config.qdrant_config.unwrap()))),
+        IndexStoreKind::Qdrant => Ok(Arc::new(QdrantDb::new(config.qdrant_config.unwrap()))),
+        IndexStoreKind::PgVector => Ok(Arc::new(PgVector::new(
+            config.pg_vector_config.unwrap(),
+            postgres_db_conn,
+        ))),
+        IndexStoreKind::OpenSearchKnn => Ok(Arc::new(OpenSearchKnn::new(
+            config.open_search_basic.unwrap(),
+        ))),
     }
 }

@@ -1,4 +1,6 @@
+use mime::Mime;
 use nanoid::nanoid;
+use sea_orm::sea_query::Expr;
 use sea_orm::{ConnectionTrait, QueryTrait};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -7,7 +9,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use entity::data_repository::Entity as DataRepositoryEntity;
 use entity::extraction_event::Entity as ExtractionEventEntity;
 use entity::extractors;
@@ -19,7 +21,6 @@ use sea_orm::{
     ActiveValue::NotSet, Database, DatabaseConnection, DbErr, EntityTrait, Set, TransactionTrait,
 };
 use sea_orm::{ConnectOptions, QueryFilter};
-use sea_query::expr::Expr;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smart_default::SmartDefault;
@@ -37,10 +38,58 @@ pub struct Index {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBindings {
+    // feature_name -> index_name
+    bindings: HashMap<String, String>,
+}
+
+impl IndexBindings {
+    pub fn from_feature_to_index_names(bindings: HashMap<String, String>) -> Self {
+        Self { bindings }
+    }
+
+    pub fn index_names(&self) -> Vec<String> {
+        self.bindings.values().cloned().collect()
+    }
+
+    pub fn get_index_name(&self, feature_name: &str) -> Option<&String> {
+        self.bindings.get(feature_name)
+    }
+
+    pub fn bindings(&self) -> HashMap<String, String> {
+        self.bindings.clone()
+    }
+
+    pub fn hash(&self, mut hasher: &mut DefaultHasher) {
+        for (feature_name, index_name) in &self.bindings {
+            feature_name.hash(&mut hasher);
+            index_name.hash(&mut hasher);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_feature(feature: &str) -> Self {
+        Self {
+            bindings: HashMap::from([(feature.into(), feature.into())]),
+        }
+    }
+}
+
+impl std::fmt::Display for IndexBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut bindings = Vec::new();
+        for (feature_name, index_name) in &self.bindings {
+            bindings.push(format!("{}:{}", feature_name, index_name));
+        }
+        write!(f, "{}", bindings.join(","))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractorBinding {
     pub id: String,
     pub extractor_name: String,
-    pub index_name: String,
+    pub indexes: IndexBindings,
     pub filters: Vec<ExtractorFilter>,
     pub input_params: serde_json::Value,
 }
@@ -49,19 +98,19 @@ impl ExtractorBinding {
     pub fn new(
         repository: &str,
         extractor_name: String,
-        index_name: String,
+        indexes: IndexBindings,
         filters: Vec<ExtractorFilter>,
         input_params: serde_json::Value,
     ) -> ExtractorBinding {
         let mut s = DefaultHasher::new();
         repository.hash(&mut s);
         extractor_name.hash(&mut s);
-        index_name.hash(&mut s);
+        indexes.hash(&mut s);
         let id = format!("{:x}", s.finish());
         ExtractorBinding {
             id,
             extractor_name,
-            index_name,
+            indexes,
             filters,
             input_params,
         }
@@ -88,16 +137,6 @@ struct ExtractorBindingsState {
 }
 
 #[derive(Clone, Error, Debug, Display, EnumString, Serialize, Deserialize, SmartDefault)]
-pub enum ContentType {
-    #[strum(serialize = "text")]
-    #[default]
-    Text,
-
-    #[strum(serialize = "pdf")]
-    Pdf,
-}
-
-#[derive(Clone, Error, Debug, Display, EnumString, Serialize, Deserialize, SmartDefault)]
 pub enum PayloadType {
     #[strum(serialize = "embedded_storage")]
     #[default]
@@ -110,7 +149,7 @@ pub enum PayloadType {
 #[derive(Debug, Clone)]
 pub struct ContentPayload {
     pub id: String,
-    pub content_type: ContentType,
+    pub content_type: mime::Mime,
     pub payload: String,
     pub payload_type: PayloadType,
     pub metadata: HashMap<String, serde_json::Value>,
@@ -128,7 +167,7 @@ impl ContentPayload {
         let id = format!("{:x}", s.finish());
         Self {
             id,
-            content_type: ContentType::Text,
+            content_type: mime::TEXT_PLAIN,
             payload: text.into(),
             payload_type: PayloadType::EmbeddedStorage,
             metadata,
@@ -140,11 +179,10 @@ impl ContentPayload {
         repository.hash(&mut s);
         name.hash(&mut s);
         let id = format!("{:x}", s.finish());
-        // TODO remove hardcoding of pdf with some thing thats
-        // parameterized.
+        let mime_type = mime_guess::from_path(name).first_or_octet_stream();
         Self {
             id,
-            content_type: ContentType::Pdf,
+            content_type: mime_type,
             payload: path.into(),
             payload_type: PayloadType::BlobStorageLink,
             metadata: HashMap::new(),
@@ -156,10 +194,38 @@ impl ContentPayload {
 #[serde(rename = "extractor_type")]
 pub enum ExtractorOutputSchema {
     #[serde(rename = "embedding")]
-    Embedding { dim: usize, distance: IndexDistance },
+    Embedding {
+        dim: usize,
+        distance_metric: IndexDistance,
+    },
 
     #[serde(rename = "attributes")]
     Attributes(serde_json::Value),
+}
+
+impl ExtractorOutputSchema {
+    #[cfg(test)]
+    pub fn embedding(dim: usize, distance_metric: IndexDistance) -> Self {
+        Self::Embedding {
+            dim,
+            distance_metric,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractorSchema {
+    pub outputs: HashMap<String, ExtractorOutputSchema>,
+}
+
+impl ExtractorSchema {
+    #[cfg(test)]
+    pub fn from_output_schema(name: &str, schema: ExtractorOutputSchema) -> Self {
+        let output_schemas = HashMap::from([(name.into(), schema)]);
+        Self {
+            outputs: output_schemas,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, EnumString, Display)]
@@ -175,16 +241,15 @@ pub enum ExtractorFilter {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename = "extractor")]
-pub struct ExtractorConfig {
+#[derive(Debug, Clone)]
+pub struct ExtractorDescription {
     pub name: String,
     pub description: String,
     pub input_params: serde_json::Value,
-    pub output_schema: ExtractorOutputSchema,
+    pub schemas: ExtractorSchema,
 }
 
-impl From<extractors::Model> for ExtractorConfig {
+impl From<extractors::Model> for ExtractorDescription {
     fn from(model: extractors::Model) -> Self {
         // TODO remove unwrap()
         let output_schema = serde_json::from_value(model.output_schema).unwrap();
@@ -192,7 +257,7 @@ impl From<extractors::Model> for ExtractorConfig {
             name: model.id,
             description: model.description,
             input_params: model.input_params,
-            output_schema,
+            schemas: output_schema,
         }
     }
 }
@@ -357,18 +422,18 @@ pub struct Work {
     pub id: String,
     pub content_id: String,
     pub repository_id: String,
-    pub index_name: String,
+    pub indexes: IndexBindings,
     pub extractor: String,
     pub extractor_params: serde_json::Value,
     pub work_state: WorkState,
-    pub worker_id: Option<String>,
+    pub executor_id: Option<String>,
 }
 
 impl Work {
     pub fn new(
         content_id: &str,
         repository: &str,
-        index_name: &str,
+        indexes: IndexBindings,
         extractor: &str,
         extractor_params: &serde_json::Value,
         worker_id: Option<&str>,
@@ -376,7 +441,7 @@ impl Work {
         let mut s = DefaultHasher::new();
         content_id.hash(&mut s);
         repository.hash(&mut s);
-        index_name.hash(&mut s);
+        indexes.hash(&mut s);
         extractor.hash(&mut s);
         let id = format!("{:x}", s.finish());
 
@@ -384,31 +449,31 @@ impl Work {
             id,
             content_id: content_id.into(),
             repository_id: repository.into(),
-            index_name: index_name.into(),
+            indexes,
             extractor: extractor.into(),
             extractor_params: extractor_params.clone(),
             work_state: WorkState::Pending,
-            worker_id: worker_id.map(|w| w.into()),
+            executor_id: worker_id.map(|w| w.into()),
         }
-    }
-
-    pub fn terminal_state(&self) -> bool {
-        self.work_state == WorkState::Completed || self.work_state == WorkState::Failed
     }
 }
 
-impl From<work::Model> for Work {
-    fn from(model: work::Model) -> Self {
-        Self {
+impl TryFrom<work::Model> for Work {
+    type Error = anyhow::Error;
+
+    fn try_from(model: work::Model) -> Result<Self, anyhow::Error> {
+        let indexes: IndexBindings =
+            serde_json::from_value(model.index_names).map_err(|e| anyhow!(e.to_string()))?;
+        Ok(Self {
             id: model.id,
             content_id: model.content_id,
             repository_id: model.repository_id,
-            index_name: model.index_name,
+            indexes,
             extractor: model.extractor,
             extractor_params: model.extractor_params,
             work_state: WorkState::from_str(&model.state).unwrap(),
-            worker_id: model.worker_id,
-        }
+            executor_id: model.worker_id,
+        })
     }
 }
 
@@ -435,19 +500,14 @@ pub enum RepositoryError {
     #[error("chunk `{0}` not found")]
     ChunkNotFound(String),
 
-    #[error("index `{0}` already exists")]
-    IndexAlreadyExists(String),
-
     #[error("unable to serialize unique params `{0}`")]
     UniqueParamsSerializationError(#[from] serde_json::Error),
-
-    #[error("session `{0}` not found")]
-    SessionNotFound(String),
 
     #[error("internal application error `{0}`")]
     LogicError(String),
 }
 
+#[derive(Debug)]
 pub struct Repository {
     conn: DatabaseConnection,
 }
@@ -456,15 +516,21 @@ impl Repository {
     pub async fn new(db_url: &str) -> Result<Self, RepositoryError> {
         let mut opt = ConnectOptions::new(db_url.to_owned());
         opt.sqlx_logging(false); // Disabling SQLx log;
-
-        let db = Database::connect(opt).await?;
-        Ok(Self { conn: db })
+        info!("connecting to db: {}", db_url);
+        let conn = Database::connect(opt).await?;
+        Ok(Self { conn })
     }
 
-    pub fn new_with_db(db: DatabaseConnection) -> Self {
-        Self { conn: db }
+    pub fn new_with_db(conn: DatabaseConnection) -> Self {
+        Self { conn }
     }
 
+    #[tracing::instrument]
+    pub fn get_db_conn_clone(&self) -> DatabaseConnection {
+        self.conn.clone()
+    }
+
+    #[tracing::instrument]
     pub async fn create_index_metadata(
         &self,
         repository: &str,
@@ -498,6 +564,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn list_indexes(&self, repository: &str) -> Result<Vec<Index>, RepositoryError> {
         let index_models = IndexEntity::find()
             .filter(index::Column::RepositoryId.eq(repository))
@@ -514,6 +581,7 @@ impl Repository {
         Ok(indexes)
     }
 
+    #[tracing::instrument]
     pub async fn get_index(
         &self,
         index: &str,
@@ -527,6 +595,7 @@ impl Repository {
             .ok_or(RepositoryError::IndexNotFound(index.into()))
     }
 
+    #[tracing::instrument]
     pub async fn add_events(
         &self,
         repository: &str,
@@ -553,6 +622,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn list_events(&self, repository: &str) -> Result<Vec<Event>, RepositoryError> {
         let events = entity::events::Entity::find()
             .filter(entity::events::Column::RepositoryId.eq(repository))
@@ -574,6 +644,7 @@ impl Repository {
         Ok(event_list)
     }
 
+    #[tracing::instrument]
     pub async fn add_content(
         &self,
         repository: &str,
@@ -635,6 +706,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn content_from_repo(
         &self,
         content_id: &str,
@@ -648,13 +720,14 @@ impl Repository {
             .ok_or(RepositoryError::ContentNotFound(content_id.to_owned()))?;
         Ok(ContentPayload {
             id: model.id,
-            content_type: ContentType::from_str(&model.content_type).unwrap(),
+            content_type: Mime::from_str(&model.content_type).unwrap(),
             payload: model.payload,
             payload_type: PayloadType::from_str(&model.payload_type).unwrap(),
             metadata: serde_json::from_value(model.metadata.unwrap()).unwrap(),
         })
     }
 
+    #[tracing::instrument]
     pub async fn content_with_unapplied_extractor(
         &self,
         repo_id: &str,
@@ -696,6 +769,7 @@ impl Repository {
         Ok(result)
     }
 
+    #[tracing::instrument]
     pub async fn mark_content_as_processed(
         &self,
         content_id: &str,
@@ -716,6 +790,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn unprocessed_extraction_events(
         &self,
     ) -> Result<Vec<ExtractionEvent>, anyhow::Error> {
@@ -731,6 +806,7 @@ impl Repository {
         Ok(events)
     }
 
+    #[tracing::instrument]
     pub async fn mark_extraction_event_as_processed(
         &self,
         extraction_id: &str,
@@ -751,6 +827,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn create_chunks(
         &self,
         chunks: Vec<Chunk>,
@@ -781,6 +858,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn chunk_with_id(&self, id: &str) -> Result<ChunkWithMetadata, RepositoryError> {
         let chunk = entity::chunked_content::Entity::find()
             .filter(entity::chunked_content::Column::ChunkId.eq(id))
@@ -805,6 +883,7 @@ impl Repository {
         })
     }
 
+    #[tracing::instrument]
     pub async fn upsert_repository(
         &self,
         repository: DataRepository,
@@ -866,6 +945,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn repositories(&self) -> Result<Vec<DataRepository>, RepositoryError> {
         let repository_models: Vec<DataRepository> = DataRepositoryEntity::find()
             .all(&self.conn)
@@ -876,6 +956,7 @@ impl Repository {
         Ok(repository_models)
     }
 
+    #[tracing::instrument]
     pub async fn repository_by_name(&self, name: &str) -> Result<DataRepository, RepositoryError> {
         let repository_model = DataRepositoryEntity::find()
             .filter(entity::data_repository::Column::Name.eq(name))
@@ -885,7 +966,11 @@ impl Repository {
         Ok(repository_model.into())
     }
 
-    pub async fn extractor_by_name(&self, name: &str) -> Result<ExtractorConfig, RepositoryError> {
+    #[tracing::instrument]
+    pub async fn extractor_by_name(
+        &self,
+        name: &str,
+    ) -> Result<ExtractorDescription, RepositoryError> {
         let extractor_model = extractors::Entity::find()
             .filter(entity::extractors::Column::Id.eq(name))
             .one(&self.conn)
@@ -899,6 +984,7 @@ impl Repository {
         Ok(extractor_model.into())
     }
 
+    #[tracing::instrument]
     pub async fn add_attributes(
         &self,
         repository: &str,
@@ -928,6 +1014,7 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn get_extracted_attributes(
         &self,
         repository: &str,
@@ -950,9 +1037,10 @@ impl Repository {
         Ok(extracted_attributes)
     }
 
+    #[tracing::instrument]
     pub async fn record_extractors(
         &self,
-        extractors: Vec<ExtractorConfig>,
+        extractors: Vec<ExtractorDescription>,
     ) -> Result<(), RepositoryError> {
         let mut extractor_models: Vec<entity::extractors::ActiveModel> = vec![];
         for extractor in extractors {
@@ -960,7 +1048,7 @@ impl Repository {
                 id: Set(extractor.name),
                 description: Set(extractor.description),
                 input_params: Set(extractor.input_params),
-                output_schema: Set(json!(extractor.output_schema)),
+                output_schema: Set(json!(extractor.schemas)),
             });
         }
         let res = entity::extractors::Entity::insert_many(extractor_models)
@@ -983,8 +1071,9 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn list_extractors(&self) -> Result<Vec<ExtractorConfig>, RepositoryError> {
-        let extractor_models: Vec<ExtractorConfig> = extractors::Entity::find()
+    #[tracing::instrument]
+    pub async fn list_extractors(&self) -> Result<Vec<ExtractorDescription>, RepositoryError> {
+        let extractor_models: Vec<ExtractorDescription> = extractors::Entity::find()
             .all(&self.conn)
             .await?
             .into_iter()
@@ -993,10 +1082,11 @@ impl Repository {
         Ok(extractor_models)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn get_extractor(
         &self,
         extractor_name: &str,
-    ) -> Result<ExtractorConfig, RepositoryError> {
+    ) -> Result<ExtractorDescription, RepositoryError> {
         let extractor_config = extractors::Entity::find()
             .filter(entity::extractors::Column::Id.eq(extractor_name))
             .one(&self.conn)
@@ -1007,13 +1097,14 @@ impl Repository {
         Ok(extractor_config.into())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn insert_work(&self, work: &Work) -> Result<(), RepositoryError> {
         let work_model = entity::work::ActiveModel {
             id: Set(work.id.clone()),
             state: Set(work.work_state.to_string()),
-            worker_id: Set(work.worker_id.as_ref().map(|id| id.to_owned())),
+            worker_id: Set(work.executor_id.as_ref().map(|id| id.to_owned())),
             content_id: Set(work.content_id.clone()),
-            index_name: Set(work.index_name.clone()),
+            index_names: Set(serde_json::to_value(work.indexes.clone()).unwrap()),
             extractor: Set(work.extractor.clone()),
             extractor_params: Set(work.extractor_params.clone()),
             repository_id: Set(work.repository_id.clone()),
@@ -1022,6 +1113,17 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
+    pub async fn work_by_id(&self, id: &str) -> Result<Work, RepositoryError> {
+        let work_model = WorkEntity::find()
+            .filter(entity::work::Column::Id.eq(id))
+            .one(&self.conn)
+            .await?
+            .ok_or(RepositoryError::RepositoryNotFound(id.into()))?;
+        Ok(work_model.try_into().unwrap())
+    }
+
+    #[tracing::instrument(skip(self))]
     pub async fn unallocated_work(&self) -> Result<Vec<work::Model>, RepositoryError> {
         let work_models = WorkEntity::find()
             .filter(entity::work::Column::WorkerId.is_null())
@@ -1031,6 +1133,7 @@ impl Repository {
         Ok(work_models)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn assign_work(
         &self,
         allocation: HashMap<String, String>,
@@ -1045,19 +1148,31 @@ impl Repository {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn update_work_state(
         &self,
         work_id: &str,
-        state: WorkState,
-    ) -> Result<(), RepositoryError> {
-        entity::work::Entity::update_many()
+        state: &WorkState,
+    ) -> Result<Work, RepositoryError> {
+        let result = entity::work::Entity::update_many()
             .col_expr(entity::work::Column::State, Expr::value(state.to_string()))
             .filter(entity::work::Column::Id.eq(work_id))
-            .exec(&self.conn)
+            .exec_with_returning(&self.conn)
             .await?;
-        Ok(())
+        if result.is_empty() {
+            return Err(RepositoryError::LogicError(
+                "unable to find work".to_string(),
+            ));
+        }
+        result
+            .get(0)
+            .map(|r| r.to_owned().try_into().unwrap())
+            .ok_or(RepositoryError::LogicError(
+                "unable to find work".to_string(),
+            ))
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn work_for_worker(&self, worker_id: &str) -> Result<Vec<Work>, RepositoryError> {
         let work_models = WorkEntity::find()
             .filter(entity::work::Column::WorkerId.eq(worker_id))
@@ -1065,11 +1180,12 @@ impl Repository {
             .all(&self.conn)
             .await?
             .into_iter()
-            .map(|m| m.into())
+            .map(|m| m.try_into().unwrap())
             .collect();
         Ok(work_models)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn binding_by_id(
         &self,
         repository: &str,
@@ -1101,19 +1217,19 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_extractors_for_repository() {
-        let extractor1 = ExtractorConfig {
+        let extractor1 = ExtractorDescription {
             name: "extractor1".into(),
             description: "extractor1".into(),
             input_params: json!({}),
-            output_schema: ExtractorOutputSchema::Embedding {
-                dim: 1,
-                distance: IndexDistance::Cosine,
-            },
+            schemas: ExtractorSchema::from_output_schema(
+                "embedding",
+                ExtractorOutputSchema::embedding(10, IndexDistance::Cosine),
+            ),
         };
         let extractor_binding1 = ExtractorBinding::new(
             "repository",
             "extractor1".into(),
-            "extractor1".into(),
+            IndexBindings::from_feature("extractor1"),
             vec![ExtractorFilter::Eq {
                 field: "topic".to_string(),
                 value: json!("pipe"),
@@ -1124,7 +1240,7 @@ mod tests {
         let extractor_binding2 = ExtractorBinding::new(
             "repository1",
             "extractor1".into(),
-            "extractor2".into(),
+            IndexBindings::from_feature("extractor1_output"),
             vec![ExtractorFilter::Neq {
                 field: "topic".to_string(),
                 value: json!("pipe"),

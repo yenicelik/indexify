@@ -1,84 +1,56 @@
-use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
-use serde::{Deserialize, Serialize};
-use tokio::{
-    signal,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use anyhow::Result;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info};
 
 use crate::{
-    api::IndexifyAPIError,
+    attribute_index::AttributeIndexManager,
+    extractor::ExtractedEmbeddings,
+    internal_api::{self, CreateWork, ExecutorInfo},
     persistence::{
-        ExtractionEventPayload, ExtractorBinding, ExtractorConfig, Repository, Work, WorkState,
+        ExtractedAttributes, ExtractionEventPayload, ExtractorBinding, Repository, Work,
     },
-    ServerConfig,
+    vector_index::VectorIndexManager,
 };
-use indexmap::{IndexMap, IndexSet};
+
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{Arc, RwLock},
-    time::SystemTime,
 };
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct ExecutorInfo {
-    pub id: String,
-    pub last_seen: u64,
-    pub available_extractors: Vec<ExtractorConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct SyncExecutor {
-    pub executor_id: String,
-    pub available_extractors: Vec<ExtractorConfig>,
-    pub work_status: Vec<Work>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct ListExecutors {
-    pub executors: Vec<ExecutorInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct ListExtractors {
-    pub extractors: Vec<ExtractorConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct SyncWorkerResponse {
-    pub content_to_process: Vec<Work>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-pub struct CreateWork {
-    pub repository_name: String,
-    pub content: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct CreateWorkResponse {}
-
+#[derive(Debug)]
 pub struct Coordinator {
     // Executor ID -> Last Seen Timestamp
-    executor_health_checks: Arc<RwLock<IndexMap<String, u64>>>,
+    executor_health_checks: Arc<RwLock<HashMap<String, u64>>>,
 
-    // List of known executors
-    executors: Arc<RwLock<IndexSet<String>>>,
+    executors: Arc<RwLock<HashMap<String, ExecutorInfo>>>,
+
+    // Extractor Name -> [Executor ID]
+    extractors_table: Arc<RwLock<HashMap<String, Vec<String>>>>,
 
     repository: Arc<Repository>,
+
+    vector_index_manager: Arc<VectorIndexManager>,
+
+    attribute_index_manager: Arc<AttributeIndexManager>,
 
     tx: Sender<CreateWork>,
 }
 
 impl Coordinator {
-    pub fn new(repository: Arc<Repository>) -> Arc<Self> {
+    pub fn new(
+        repository: Arc<Repository>,
+        vector_index_manager: Arc<VectorIndexManager>,
+        attribute_index_manager: Arc<AttributeIndexManager>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(32);
 
         let coordinator = Arc::new(Self {
-            executor_health_checks: Arc::new(RwLock::new(IndexMap::new())),
-            executors: Arc::new(RwLock::new(IndexSet::new())),
+            executor_health_checks: Arc::new(RwLock::new(HashMap::new())),
+            executors: Arc::new(RwLock::new(HashMap::new())),
+            extractors_table: Arc::new(RwLock::new(HashMap::new())),
             repository,
+            vector_index_manager,
+            attribute_index_manager,
             tx,
         });
         let coordinator_clone = coordinator.clone();
@@ -88,17 +60,40 @@ impl Coordinator {
         coordinator
     }
 
+    pub async fn get_executors(&self) -> Result<Vec<ExecutorInfo>> {
+        let executors = self.executors.read().unwrap();
+        Ok(executors.values().cloned().collect())
+    }
+
+    #[tracing::instrument(skip(self))]
     pub async fn record_executor(&self, worker: ExecutorInfo) -> Result<(), anyhow::Error> {
+        // First see if the executor is already in the table
+        let is_new_executor = self
+            .executor_health_checks
+            .read()
+            .unwrap()
+            .get(&worker.id)
+            .is_none();
         self.executor_health_checks
             .write()
             .unwrap()
             .insert(worker.id.clone(), worker.last_seen);
-
-        // Add the worker to our list of active workers
-        self.executors.write().unwrap().insert(worker.id);
+        if is_new_executor {
+            info!("recording new executor: {}", &worker.id);
+            self.executors
+                .write()
+                .unwrap()
+                .insert(worker.id.clone(), worker.clone());
+            let mut extractors_table = self.extractors_table.write().unwrap();
+            let executors = extractors_table
+                .entry(worker.extractor.name.clone())
+                .or_default();
+            executors.push(worker.id.clone());
+        }
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn process_extraction_events(&self) -> Result<(), anyhow::Error> {
         let events = self.repository.unprocessed_extraction_events().await?;
         for event in &events {
@@ -127,6 +122,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn generate_work_for_extractor_bindings(
         &self,
         repository: &str,
@@ -142,28 +138,30 @@ impl Coordinator {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn distribute_work(&self) -> Result<(), anyhow::Error> {
         let unallocated_work = self.repository.unallocated_work().await?;
 
         // work_id -> executor_id
         let mut work_assignment = HashMap::new();
         for work in unallocated_work {
-            let rand_index = rand::random::<usize>() % self.executors.read().unwrap().len();
-            let executor = self
-                .executors
-                .read()
-                .unwrap()
-                .get_index(rand_index)
-                .cloned();
-            if let Some(executor) = executor {
-                info!("assigning work {} to executor {}", work.id, executor);
-                work_assignment.insert(work.id.clone(), executor.clone());
+            let extractor_table = self.extractors_table.read().unwrap();
+            let executors = extractor_table.get(&work.extractor).ok_or(anyhow::anyhow!(
+                "no executors for extractor: {}",
+                work.extractor
+            ))?;
+            let rand_index = rand::random::<usize>() % executors.len();
+            if !executors.is_empty() {
+                let executor_id = executors[rand_index].clone();
+                work_assignment.insert(work.id.clone(), executor_id);
             }
         }
+        info!("finishing work assignment: {:}", work_assignment.len());
         self.repository.assign_work(work_assignment).await?;
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn create_work(
         &self,
         repository_id: &str,
@@ -185,12 +183,12 @@ impl Coordinator {
                     &repository_id,
                     &content.id,
                     &extractor_binding.extractor_name,
-                    &extractor_binding.index_name
+                    extractor_binding.indexes,
                 );
                 let work = Work::new(
                     &content.id,
                     repository_id,
-                    &extractor_binding.index_name,
+                    extractor_binding.indexes.clone(),
                     &extractor_binding.extractor_name,
                     &extractor_binding.input_params,
                     None,
@@ -205,46 +203,37 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn update_work_state(
+    #[tracing::instrument(skip(self))]
+    pub async fn record_extractor(
         &self,
-        work_list: Vec<Work>,
+        extractor: internal_api::ExtractorDescription,
+    ) -> Result<(), anyhow::Error> {
+        self.repository
+            .record_extractors(vec![extractor.try_into().unwrap()])
+            .await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_work_for_worker(
+        &self,
         worker_id: &str,
-    ) -> Result<(), anyhow::Error> {
-        for work in work_list.iter() {
-            info!(
-                "updating work status by worker: {}, work id: {}, status: {}",
-                worker_id, &work.id, &work.work_state
-            );
-            match work.work_state {
-                WorkState::Completed | WorkState::Failed => {
-                    if let Err(err) = self
-                        .repository
-                        .update_work_state(&work.id, work.work_state.clone())
-                        .await
-                    {
-                        error!("unable to update work state: {}", err.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn record_extractors(
-        &self,
-        extractors: Vec<ExtractorConfig>,
-    ) -> Result<(), anyhow::Error> {
-        self.repository.record_extractors(extractors).await?;
-        Ok(())
-    }
-
-    pub async fn get_work_for_worker(&self, worker_id: &str) -> Result<Vec<Work>, anyhow::Error> {
+    ) -> Result<Vec<internal_api::Work>, anyhow::Error> {
         let work_list = self.repository.work_for_worker(worker_id).await?;
+        let mut result = Vec::new();
+        for work in work_list {
+            let content_payload = self
+                .repository
+                .content_from_repo(&work.content_id, &work.repository_id)
+                .await?;
+            let internal_api_work = internal_api::create_work(work, content_payload)?;
+            result.push(internal_api_work);
+        }
 
-        Ok(work_list)
+        Ok(result)
     }
 
+    #[tracing::instrument(skip(self, rx))]
     async fn loop_for_work(&self, mut rx: Receiver<CreateWork>) -> Result<(), anyhow::Error> {
         info!("starting work distribution loop");
         loop {
@@ -258,6 +247,7 @@ impl Coordinator {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn process_and_distribute_work(&self) -> Result<(), anyhow::Error> {
         info!("received work request, processing extraction events");
         self.process_extraction_events().await?;
@@ -266,147 +256,73 @@ impl Coordinator {
         self.distribute_work().await?;
         Ok(())
     }
-}
 
-pub struct CoordinatorServer {
-    addr: SocketAddr,
-    coordinator: Arc<Coordinator>,
-}
-
-impl CoordinatorServer {
-    pub async fn new(config: Arc<ServerConfig>) -> Result<Self, anyhow::Error> {
-        let addr: SocketAddr = config.coordinator_addr.parse()?;
-        let repository = Arc::new(Repository::new(&config.db_url).await?);
-        let coordinator = Coordinator::new(repository);
-        info!("Coordinator listening on: {}", &config.coordinator_addr);
-        Ok(Self { addr, coordinator })
+    pub async fn get_executor(&self, extractor_name: &str) -> Result<ExecutorInfo, anyhow::Error> {
+        let extractors_table = self.extractors_table.read().unwrap();
+        let executors = extractors_table.get(extractor_name).ok_or(anyhow::anyhow!(
+            "no executors for extractor: {}",
+            extractor_name
+        ))?;
+        let rand_index = rand::random::<usize>() % executors.len();
+        let executor_id = executors[rand_index].clone();
+        let executors = self.executors.read().unwrap();
+        let executor = executors
+            .get(&executor_id)
+            .ok_or(anyhow::anyhow!("no executor found for id: {}", executor_id))?;
+        Ok(executor.clone())
     }
 
-    pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let app = Router::new()
-            .route("/", get(root))
-            .route(
-                "/sync_executor",
-                post(sync_executor).with_state(self.coordinator.clone()),
-            )
-            .route(
-                "/executors",
-                get(list_executors).with_state(self.coordinator.clone()),
-            )
-            .route(
-                "/create_work",
-                post(create_work).with_state(self.coordinator.clone()),
-            );
-        axum::Server::bind(&self.addr)
-            .serve(app.into_make_service())
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+    pub async fn publish_work(&self, work: CreateWork) -> Result<(), anyhow::Error> {
+        self.tx.send(work).await?;
         Ok(())
     }
 
-    pub async fn run_extractors(&self) -> Result<(), anyhow::Error> {
+    #[tracing::instrument(skip(self))]
+    pub async fn write_extracted_data(
+        &self,
+        work_status_list: Vec<internal_api::WorkStatus>,
+    ) -> Result<()> {
+        for work_status in work_status_list {
+            let work = self
+                .repository
+                .update_work_state(&work_status.work_id, &work_status.status.into())
+                .await?;
+            for extracted_content in work_status.extracted_content {
+                if let Some(feature) = extracted_content.feature.clone() {
+                    let index_name = work
+                        .indexes
+                        .get_index_name(feature.name.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("no index name found for feature: {}", feature.name)
+                        })?;
+                    if let Some(text) = extracted_content.source_as_text() {
+                        if let Some(embedding) = feature.embedding() {
+                            let embeddings = ExtractedEmbeddings {
+                                content_id: work.content_id.clone(),
+                                text: text.clone(),
+                                embeddings: embedding.clone(),
+                            };
+                            self.vector_index_manager
+                                .add_embedding(&work.repository_id, index_name, vec![embeddings])
+                                .await?;
+                        }
+                    }
+                    if let Some(metadata) = feature.metadata() {
+                        let extracted_attributes = ExtractedAttributes::new(
+                            &work.content_id,
+                            metadata.clone(),
+                            &work.extractor,
+                        );
+                        self.attribute_index_manager
+                            .add_index(&work.repository_id, index_name, extracted_attributes)
+                            .await?;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
-}
-
-async fn root() -> &'static str {
-    "Indexify Coordinator"
-}
-
-#[axum_macros::debug_handler]
-async fn list_executors(
-    State(coordinator): State<Arc<Coordinator>>,
-) -> Result<Json<ListExecutors>, IndexifyAPIError> {
-    // TODO FIX THIS - available extractors needs to be populated.
-    let executors = coordinator.executor_health_checks.read().unwrap().clone();
-    let executors = executors
-        .into_iter()
-        .map(|(id, last_seen)| ExecutorInfo {
-            id,
-            last_seen,
-            available_extractors: vec![],
-        })
-        .collect();
-    Ok(Json(ListExecutors { executors }))
-}
-
-#[axum_macros::debug_handler]
-async fn sync_executor(
-    State(coordinator): State<Arc<Coordinator>>,
-    Json(worker): Json<SyncExecutor>,
-) -> Result<Json<SyncWorkerResponse>, IndexifyAPIError> {
-    // Record the health check of the worker
-    let worker_id = worker.executor_id.clone();
-    let _ = coordinator
-        .record_executor(ExecutorInfo {
-            id: worker_id.clone(),
-            last_seen: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            available_extractors: worker.available_extractors.clone(),
-        })
-        .await;
-    // Record the outcome of any work the worker has done
-    coordinator
-        .update_work_state(worker.work_status, &worker_id)
-        .await
-        .map_err(|e| IndexifyAPIError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Record the extractors available on the executor
-    coordinator
-        .record_extractors(worker.available_extractors)
-        .await
-        .map_err(|e| IndexifyAPIError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Find more work for the worker
-    let queued_work = coordinator
-        .get_work_for_worker(&worker.executor_id)
-        .await
-        .map_err(|e| IndexifyAPIError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Respond
-    Ok(Json(SyncWorkerResponse {
-        content_to_process: queued_work,
-    }))
-}
-
-#[axum_macros::debug_handler]
-async fn create_work(
-    State(coordinator): State<Arc<Coordinator>>,
-    Json(create_work): Json<CreateWork>,
-) -> Result<Json<CreateWorkResponse>, IndexifyAPIError> {
-    if let Err(err) = coordinator.tx.try_send(create_work) {
-        error!("unable to send create work request: {}", err.to_string());
-    }
-    Ok(Json(CreateWorkResponse {}))
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-        },
-        _ = terminate => {
-        },
-    }
-    info!("signal received, shutting down server gracefully");
 }
 
 #[cfg(test)]
@@ -415,7 +331,7 @@ mod tests {
 
     use crate::{
         blob_storage::BlobStorageBuilder,
-        persistence::ExtractorBinding,
+        persistence::{ExtractorBinding, IndexBindings},
         test_util::{
             self,
             db_utils::{DEFAULT_TEST_EXTRACTOR, DEFAULT_TEST_REPOSITORY},
@@ -448,7 +364,7 @@ mod tests {
                 extractor_bindings: vec![ExtractorBinding::new(
                     DEFAULT_TEST_REPOSITORY,
                     DEFAULT_TEST_EXTRACTOR.into(),
-                    DEFAULT_TEST_EXTRACTOR.into(),
+                    IndexBindings::from_feature(DEFAULT_TEST_EXTRACTOR),
                     vec![],
                     serde_json::json!({}),
                 )],

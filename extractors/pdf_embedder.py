@@ -1,5 +1,5 @@
-from .base_extractor import ExtractorInfo, Content, Embeddings, Extractor, EmbeddingSchema
-from .sentence_transformer import SentenceTransformersEmbedding
+from indexify_extractor_sdk.base_extractor import ExtractorInfo, Content, Embeddings, Extractor, EmbeddingSchema
+from indexify_extractor_sdk.sentence_transformer import SentenceTransformersEmbedding
 from pypdf import PdfReader
 from langchain import text_splitter
 import json
@@ -32,7 +32,9 @@ class PDFEmbedder(Extractor):
                 for (i, (chunk, embeddings)) in enumerate(zip(chunks, embeddings)):
                     embeddings_list.append(Embeddings(content_id=c.id, text=chunk, embeddings=embeddings, metadata=json.dumps({"page": i})))
         return embeddings_list
-
+    
+    def extract_query_embeddings(self, query: str) -> List[float]:
+        return self._model.embed_query(query)
 
     def info(self) -> ExtractorInfo:
         input_params = PDFEmbeddingInputParams()

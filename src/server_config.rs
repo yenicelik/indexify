@@ -1,12 +1,26 @@
-use anyhow::Result;
+use anyhow::{anyhow, Error, Result};
 use figment::{
     providers::{Env, Format, Yaml},
     Figment,
 };
-use serde::{Deserialize, Serialize};
-use std::fs;
 
-const OPENAI_DUMMY_KEY: &str = "xxxxx";
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt, fs,
+    net::{AddrParseError, IpAddr, Ipv4Addr, SocketAddr},
+};
+
+fn default_executor_port() -> u64 {
+    0
+}
+
+fn default_server_port() -> u64 {
+    8900
+}
+
+fn default_coordinator_port() -> u64 {
+    8950
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3Config {
@@ -20,48 +34,18 @@ pub struct DiskStorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlobStorage {
+pub struct BlobStorageConfig {
     pub backend: String,
     pub s3: Option<S3Config>,
     pub disk: Option<DiskStorageConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ExtractorDriver {
-    #[serde(rename = "builtin")]
-    BuiltIn,
-
-    #[serde(rename = "python")]
-    Python,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Extractor {
-    pub name: String,
-    pub path: String,
-    pub driver: ExtractorDriver,
-}
-
-impl Default for Extractor {
-    fn default() -> Self {
-        Self {
-            name: "default_embedder".to_string(),
-            path: "MiniLML6Extractor".to_string(),
-            driver: ExtractorDriver::Python,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct OpenAIConfig {
-    pub api_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum_macros::Display)]
 #[strum(serialize_all = "kebab-case")]
 pub enum IndexStoreKind {
     Qdrant,
+    PgVector,
+    OpenSearchKnn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,21 +64,39 @@ impl Default for QdrantConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct PgEmbeddingConfig {
+pub struct OpenSearchBasicConfig {
+    pub addr: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl Default for OpenSearchBasicConfig {
+    fn default() -> Self {
+        Self {
+            addr: "https://localhost:9200".into(),
+            username: "admin".into(),
+            password: "admin".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PgVectorConfig {
     pub addr: String,
     pub m: i32,
     pub efconstruction: i32,
     pub efsearch: i32,
 }
 
-impl Default for PgEmbeddingConfig {
+impl Default for PgVectorConfig {
     fn default() -> Self {
         Self {
             addr: "postgres://postgres:postgres@localhost/indexify".into(),
             // Figure out best default parameters for the following values
-            m: 3,
-            efsearch: 5,
-            efconstruction: 5,
+            m: 16,
+            efsearch: 64,
+            efconstruction: 40,
         }
     }
 }
@@ -104,6 +106,8 @@ impl Default for PgEmbeddingConfig {
 pub struct VectorIndexConfig {
     pub index_store: IndexStoreKind,
     pub qdrant_config: Option<QdrantConfig>,
+    pub pg_vector_config: Option<PgVectorConfig>,
+    pub open_search_basic: Option<OpenSearchBasicConfig>,
 }
 
 impl Default for VectorIndexConfig {
@@ -111,47 +115,158 @@ impl Default for VectorIndexConfig {
         Self {
             index_store: IndexStoreKind::Qdrant,
             qdrant_config: Some(QdrantConfig::default()),
+            pg_vector_config: Some(PgVectorConfig::default()),
+            open_search_basic: Some(OpenSearchBasicConfig::default()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExtractorConfig {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub module: String,
+    pub gpu: bool,
+    pub system_dependencies: Vec<String>,
+    pub python_dependencies: Vec<String>,
+}
+
+impl ExtractorConfig {
+    pub fn from_path(path: String) -> Result<ExtractorConfig> {
+        let config = std::fs::read_to_string(path)?;
+        let config: ExtractorConfig = serde_yaml::from_str(&config)?;
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NetworkAddress(String);
+
+impl Default for NetworkAddress {
+    fn default() -> Self {
+        // NOTE - This is not a perfect algorithm to probe the network address
+        // we should advertise. The user should be setting this in the config.
+        // 1. Probe for all the interfaces
+        // 2. Find the one that is not loopback
+        // 3. If there is nothing else - use loopback
+        // 4. Return "" if there is no interfaces at all, and it will eventually fail.
+        let ip = local_ip_address::local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        Self(ip.to_string())
+    }
+}
+
+impl fmt::Display for NetworkAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.clone())
+    }
+}
+
+impl fmt::Debug for NetworkAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.clone())
+    }
+}
+
+impl From<NetworkAddress> for String {
+    fn from(addr: NetworkAddress) -> Self {
+        addr.0
+    }
+}
+
+impl From<&str> for NetworkAddress {
+    fn from(addr: &str) -> Self {
+        Self(addr.to_owned())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExecutorConfig {
-    pub server_listen_addr: String,
-    pub executor_id: Option<String>,
+    #[serde(default)]
+    pub listen_if: NetworkAddress,
+    #[serde(default)]
+    pub advertise_if: NetworkAddress,
+    #[serde(default = "default_executor_port")]
+    pub listen_port: u64,
+    #[serde(default)]
+    pub coordinator_addr: String,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            listen_if: NetworkAddress::default(),
+            advertise_if: NetworkAddress::default(),
+            listen_port: default_executor_port(),
+            coordinator_addr: format!("localhost:{}", default_coordinator_port()),
+        }
+    }
+}
+
+impl ExecutorConfig {
+    pub fn listen_addr_sock(&self) -> Result<SocketAddr> {
+        let addr = format!("{}:{}", self.listen_if, self.listen_port);
+        addr.parse().map_err(|e: AddrParseError| {
+            anyhow!("Failed to parse listen address {} :{}", addr, e.to_string())
+        })
+    }
+
+    pub fn with_advertise_ip(mut self, ip: Option<String>) -> Self {
+        if let Some(ip) = ip {
+            self.advertise_if = NetworkAddress(ip);
+        }
+        self
+    }
+
+    pub fn with_advertise_port(mut self, port: Option<u64>) -> Self {
+        if let Some(port) = port {
+            self.listen_port = port;
+        }
+        self
+    }
+
+    pub fn with_advertise_addr(mut self, addr: Option<String>) -> Result<Self, Error> {
+        if let Some(addr) = addr {
+            let sock_addr: SocketAddr = addr.parse()?;
+            self.advertise_if = NetworkAddress(sock_addr.ip().to_string());
+            self.listen_port = sock_addr.port() as u64;
+        }
+        Ok(self)
+    }
+
+    pub fn with_coordinator_addr(mut self, addr: String) -> Self {
+        self.coordinator_addr = addr;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ServerConfig {
-    pub listen_addr: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai: Option<OpenAIConfig>,
+    #[serde(default)]
+    pub listen_if: NetworkAddress,
+    #[serde(default = "default_server_port")]
+    pub listen_port: u64,
+    #[serde(default = "default_coordinator_port")]
+    pub coordinator_port: u64,
     pub index_config: VectorIndexConfig,
     pub db_url: String,
+    #[serde(default)]
     pub coordinator_addr: String,
-    pub executor_config: ExecutorConfig,
-    pub extractors: Vec<Extractor>,
-    pub blob_storage: BlobStorage,
+    pub blob_storage: BlobStorageConfig,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:8900".to_string(),
-            openai: Some(OpenAIConfig {
-                api_key: OPENAI_DUMMY_KEY.into(),
-            }),
+            listen_if: "0.0.0.0".into(),
+            listen_port: default_server_port(),
+            coordinator_port: default_coordinator_port(),
             index_config: VectorIndexConfig::default(),
-            db_url: "sqlite://indexify.db".into(),
-            coordinator_addr: "0.0.0.0:8950".to_string(),
-            executor_config: ExecutorConfig {
-                server_listen_addr: "0.0.0.0:8951".to_string(),
-                executor_id: None,
-            },
-            extractors: vec![Extractor::default()],
-            blob_storage: BlobStorage {
+            db_url: "postgres://postgres:postgres@localhost/indexify".into(),
+            coordinator_addr: format!("localhost:{}", default_coordinator_port()),
+            blob_storage: BlobStorageConfig {
                 backend: "disk".to_string(),
                 s3: None,
                 disk: Some(DiskStorageConfig {
@@ -165,19 +280,11 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn from_path(path: &str) -> Result<Self> {
         let config_str: String = fs::read_to_string(path)?;
-        let mut config: ServerConfig = Figment::new()
+        let config: ServerConfig = Figment::new()
             .merge(Yaml::string(&config_str))
             .merge(Env::prefixed("INDEXIFY_"))
             .extract()?;
 
-        // TODO Merge the openai api key from env only if there is nothing set in config
-        // or it's not dummy
-        if let Ok(openai_api_key) = std::env::var("OPENAI_API_KEY") {
-            let openai_config = OpenAIConfig {
-                api_key: openai_api_key,
-            };
-            config.openai = Some(openai_config);
-        }
         Ok(config)
     }
 
@@ -187,17 +294,29 @@ impl ServerConfig {
         std::fs::write(path, str)?;
         Ok(())
     }
+
+    pub fn listen_addr_sock(&self) -> Result<SocketAddr> {
+        let addr = format!("{}:{}", self.listen_if, self.listen_port);
+        addr.parse().map_err(|e: AddrParseError| {
+            anyhow!("Failed to parse listen address {} :{}", addr, e.to_string())
+        })
+    }
+
+    pub fn coordinator_lis_addr_sock(&self) -> Result<SocketAddr> {
+        let addr = format!("{}:{}", self.listen_if, self.coordinator_port);
+        addr.parse().map_err(|e: AddrParseError| {
+            anyhow!("Failed to parse listen address {} :{}", addr, e.to_string())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::server_config::OPENAI_DUMMY_KEY;
 
     #[test]
     fn parse_config() {
         // Uses the sample config file to test the config parsing
         let config = super::ServerConfig::from_path("sample_config.yaml").unwrap();
-        assert_eq!(OPENAI_DUMMY_KEY, config.openai.unwrap().api_key);
         assert_eq!(
             config.index_config.index_store,
             super::IndexStoreKind::Qdrant

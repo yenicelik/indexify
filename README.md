@@ -2,18 +2,16 @@
 
 ![Tests](https://github.com/diptanu/indexify/actions/workflows/test.yaml/badge.svg?branch=main)
 
-Indexify is a knowledge and memory retrieval service for Large Language Models. It facilitates in-context learning of LLMs by providing relevant context in a prompt or exposing relevant memory to AI agents.
+Indexify is a reactive structured extraction engine for un-structured data.
 
-Indexify has a built in data parallel content extraction engine which enables scalable extraciton of content using AI models to keep indexes updated in real time(or re-index with a new model) as data is ingested.
+Applications leveraging LLMs for autonomous planning or queries necessitate timely index updates aligned with data changes or new extraction methods. Indexify enables both, by applying feature extractors on data in real-time and updating one or many indexes.
 
 ## Why use Indexify
-**Knowledge Base for LLMs:** Real time retrieval of knowledge and context from private documents and structured data to improve accuracy of LLM models.
 
-**Memory Engine for Co-Pilot agents:** Store and retrieve long-term memory of agents in real-time, providing enhanced personalization and improved user experiences for co-pilot and chat based applications.
-
-**Distributed Extraction Engine For Scale:** Distributed extraction to scale indexing large amount of data without sacrificing retrieval performance.
-
-**Custom Extractors:** You can extend Indexify by writing a custom extractor for your use cases to extract specific information from data.
+* **Knowledge Base for LLMs:** Real-time structured extraction and embedding generation from any un-structured data to feed relevant context to AI Applications.
+* **Distributed Extraction Engine For Scale:** Distributed extraction to scale indexing large amounts of data without sacrificing retrieval performance.
+* **Custom Extractors:** You can extend Indexify by writing a custom extractor for your use cases to extract specific information from data.
+* **Pluggable Storage:** Use one of the many storage backends to persist indexes.
 
 ## Getting Started
 

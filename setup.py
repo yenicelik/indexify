@@ -12,14 +12,14 @@ from distutils.util import convert_path
 from setuptools import Command, find_packages, setup
 
 main_ns = {}
-ver_path = convert_path("indexify_extractors/version.py")
+ver_path = convert_path("indexify_extractor_sdk/version.py")
 with open(ver_path) as ver_file:
     exec(ver_file.read(), main_ns)
 
 
 # Package meta-data.
-NAME = "indexify-extractors"
-DESCRIPTION = "Content Extractors for Indexify"
+NAME = "indexify-extractor-sdk"
+DESCRIPTION = "Content Extractor SDK for Indexify"
 URL = "https://github.com/diptanu/indexify"
 EMAIL = "diptanuc@gmail.com"
 AUTHOR = "Diptanu Choudhury"
@@ -30,12 +30,8 @@ VERSION = main_ns["__version__"]
 REQUIRED = [
     "torch",
     "langchain",
-    "fastembed",
-    "openai",
     "pydantic",
     "transformers",
-    "span_marker",
-    "pypdf",
 ]
 
 # What packages are optional?
@@ -54,6 +50,7 @@ EXTRAS = {
         "pytest-asyncio",
         "parameterized",
     ],
+    "test": ["pypdf", "span_marker", "parameterized"],
     "manifest": "manifest-ml",
     "profanity": ["alt-profanity-check"],
     "critique": ["inspiredco"],

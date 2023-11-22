@@ -1,11 +1,18 @@
 use anyhow::Result;
 
+use std::fmt;
 use std::sync::Arc;
 
-use crate::persistence::{ExtractedAttributes, ExtractorConfig, Repository};
+use crate::persistence::{ExtractedAttributes, ExtractorDescription, Repository};
 
 pub struct AttributeIndexManager {
     repository: Arc<Repository>,
+}
+
+impl fmt::Debug for AttributeIndexManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttributeIndexManager").finish()
+    }
 }
 
 impl AttributeIndexManager {
@@ -17,7 +24,7 @@ impl AttributeIndexManager {
         &self,
         repository: &str,
         index_name: &str,
-        extractor_config: ExtractorConfig,
+        extractor_config: ExtractorDescription,
     ) -> Result<()> {
         // TODO: create a new table for the index from a postgres schema
         self.repository
@@ -26,7 +33,7 @@ impl AttributeIndexManager {
                 &extractor_config.name,
                 index_name,
                 "structured_store",
-                serde_json::json!(extractor_config.output_schema),
+                serde_json::json!(extractor_config.schemas),
                 "structured_index",
             )
             .await?;

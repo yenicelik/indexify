@@ -2,14 +2,20 @@ use crate::attribute_index::AttributeIndexManager;
 use crate::blob_storage::BlobStorageBuilder;
 use crate::data_repository_manager::DataRepositoryManager;
 use crate::persistence::Repository;
+use crate::server_config::ServerConfig;
 use crate::vector_index::VectorIndexManager;
-use crate::ServerConfig;
-use crate::{api::*, persistence, vectordbs, CreateWork, CreateWorkResponse};
+use crate::{
+    api::*,
+    internal_api::{CreateWork, CreateWorkResponse},
+    persistence, vectordbs,
+};
+use axum_otel_metrics::HttpMetricsLayerBuilder;
 
 use anyhow::Result;
 use axum::extract::{Multipart, Path, Query};
 use axum::http::StatusCode;
 use axum::{extract::State, routing::get, routing::post, Json, Router};
+use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
 use pyo3::Python;
 use tokio::signal;
 use tracing::{error, info};
@@ -25,10 +31,10 @@ use std::sync::Arc;
 
 const DEFAULT_SEARCH_LIMIT: u64 = 5;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RepositoryEndpointState {
     repository_manager: Arc<DataRepositoryManager>,
-    coordinator_addr: SocketAddr,
+    coordinator_addr: String,
 }
 
 #[derive(OpenApi)]
@@ -49,10 +55,10 @@ pub struct RepositoryEndpointState {
         ),
         components(
             schemas(CreateRepository, CreateRepositoryResponse, DataConnector,
-                IndexDistance, ExtractorContentType,
+                IndexDistance,
                 SourceType, TextAddRequest, TextAdditionResponse, Text, IndexSearchResponse,
                 DocumentFragment, ListIndexesResponse, ExtractorOutputSchema, Index, SearchRequest, ListRepositoriesResponse, ListExtractorsResponse
-            , ExtractorConfig, DataRepository, ExtractorBinding, ExtractorFilter, ExtractorBindRequest, ExtractorBindResponse, Executor,
+            , ExtractorDescription, DataRepository, ExtractorBinding, ExtractorFilter, ExtractorBindRequest, ExtractorBindResponse, Executor,
         ListEventsResponse, EventAddRequest, EventAddResponse, Event, AttributeLookupResponse, ExtractedAttributes, ListExecutorsResponse)
         ),
         tags(
@@ -67,21 +73,25 @@ pub struct Server {
 }
 impl Server {
     pub fn new(config: Arc<super::server_config::ServerConfig>) -> Result<Self> {
-        let addr: SocketAddr = config.listen_addr.parse()?;
+        let addr: SocketAddr = config.listen_addr_sock()?;
         Ok(Self { addr, config })
     }
 
     pub async fn run(&self) -> Result<()> {
         let repository = Arc::new(Repository::new(&self.config.db_url).await?);
-        let vectordb = vectordbs::create_vectordb(self.config.index_config.clone())?;
+        let vector_db = vectordbs::create_vectordb(
+            self.config.index_config.clone(),
+            repository.get_db_conn_clone(),
+        )?;
         let vector_index_manager = Arc::new(VectorIndexManager::new(
-            self.config.clone(),
             repository.clone(),
-            vectordb.clone(),
+            vector_db.clone(),
+            self.config.coordinator_lis_addr_sock().unwrap().to_string(),
         ));
         let attribute_index_manager = Arc::new(AttributeIndexManager::new(repository.clone()));
 
-        let blob_storage = BlobStorageBuilder::new(self.config.clone()).build()?;
+        let blob_storage =
+            BlobStorageBuilder::new(Arc::new(self.config.blob_storage.clone())).build()?;
 
         let repository_manager = Arc::new(
             DataRepositoryManager::new(
@@ -98,12 +108,13 @@ impl Server {
         {
             panic!("failed to create default repository: {}", err)
         }
-        let coordinator_addr: SocketAddr = self.config.coordinator_addr.parse()?;
         let repository_endpoint_state = RepositoryEndpointState {
             repository_manager: repository_manager.clone(),
-            coordinator_addr,
+            coordinator_addr: self.config.coordinator_lis_addr_sock().unwrap().to_string(),
         };
+        let metrics = HttpMetricsLayerBuilder::new().build();
         let app = Router::new()
+            .merge(metrics.routes())
             .merge(SwaggerUi::new("/api-docs-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
             .merge(Redoc::with_url("/redoc", ApiDoc::openapi()))
             .merge(RapiDoc::new("/api-docs/openapi.json").path("/rapidoc"))
@@ -163,8 +174,10 @@ impl Server {
             .route(
                 "/extractors",
                 get(list_extractors).with_state(repository_endpoint_state.clone()),
-            );
-        info!("server is listening at addr {:?}", &self.addr.to_string());
+            )
+            .layer(OtelAxumLayer::default())
+            .layer(metrics);
+        info!("server is listening at addr {}", &self.addr.to_string());
         axum::Server::bind(&self.addr)
             .serve(app.into_make_service())
             .with_graceful_shutdown(shutdown_signal())
@@ -173,10 +186,12 @@ impl Server {
     }
 }
 
+#[tracing::instrument]
 async fn root() -> &'static str {
     "Indexify Server"
 }
 
+#[tracing::instrument]
 #[axum_macros::debug_handler]
 #[utoipa::path(
     post,
@@ -217,6 +232,7 @@ async fn create_repository(
     Ok(Json(CreateRepositoryResponse {}))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/repositories",
@@ -245,6 +261,7 @@ async fn list_repositories(
     }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/repositories/{repository_name}",
@@ -274,6 +291,7 @@ async fn get_repository(
     }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     post,
     path = "/repositories/{repository_name}/extractor_bindings",
@@ -313,6 +331,7 @@ async fn bind_extractor(
     Ok(Json(ExtractorBindResponse {}))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     post,
     path = "/repositories/{repository_name}/add_texts",
@@ -347,13 +366,14 @@ async fn add_texts(
             )
         })?;
 
-    if let Err(err) = _run_extractors(&repository_name, &state.coordinator_addr.to_string()).await {
+    if let Err(err) = _run_extractors(&repository_name, &state.coordinator_addr.clone()).await {
         error!("unable to run extractors: {}", err.to_string());
     }
 
     Ok(Json(TextAdditionResponse::default()))
 }
 
+#[tracing::instrument]
 #[axum_macros::debug_handler]
 async fn upload_file(
     Path(repository_name): Path<String>,
@@ -398,6 +418,7 @@ async fn _run_extractors(repository: &str, coordinator_addr: &str) -> Result<(),
     Ok(())
 }
 
+#[tracing::instrument]
 async fn run_extractors(
     Path(repository_name): Path<String>,
     State(state): State<RepositoryEndpointState>,
@@ -408,6 +429,7 @@ async fn run_extractors(
     Ok(Json(RunExtractorsResponse {}))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     post,
     path = "/repositories/{repository_name}/events",
@@ -438,6 +460,7 @@ async fn add_events(
     Ok(Json(EventAddResponse {}))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/repositories/{repository_name}/events",
@@ -464,6 +487,7 @@ async fn list_events(
     Ok(Json(ListEventsResponse { messages }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/executors",
@@ -480,6 +504,7 @@ async fn list_executors(
     Ok(Json(ListExecutorsResponse { executors: vec![] }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/extractors",
@@ -504,6 +529,7 @@ async fn list_extractors(
     Ok(Json(ListExtractorsResponse { extractors }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/repositories/{repository_name}/indexes",
@@ -529,6 +555,7 @@ async fn list_indexes(
     Ok(Json(ListIndexesResponse { indexes }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     post,
     path = "/repository/{repository_name}/search",
@@ -568,6 +595,7 @@ async fn index_search(
     }))
 }
 
+#[tracing::instrument]
 #[utoipa::path(
     get,
     path = "/repository/{repository_name}/attributes",
@@ -595,6 +623,7 @@ async fn attribute_lookup(
     }))
 }
 
+#[tracing::instrument]
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
