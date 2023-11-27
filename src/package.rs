@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use std::env;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 
 use crate::server_config::ExtractorConfig;
 
@@ -139,9 +139,11 @@ COPY indexify_extractor_sdk /indexify/indexify_extractor_sdk
 COPY setup.py /indexify/setup.py
 
 RUN python3 setup.py install
-        "
+"
         } else {
-            ""
+            "
+RUN pip3 install --no-input indexify_extractor_sdk
+"
         };
         let tmpl = DockerfileTemplate {
             system_dependencies: &system_dependencies,
@@ -158,13 +160,15 @@ RUN python3 setup.py install
     ) -> Result<()> {
         for entry in WalkDir::new(dir_path) {
             let entry = entry?;
-            let path = entry.path();
+            let src_path = entry.path();
             let metadata = entry.metadata()?;
+            let path_name = src_path.strip_prefix(dir_path)?;
+            let path_name = Path::new("extractors").join(path_name);
 
             if metadata.is_dir() {
-                tar_builder.append_dir_all(path, path)?;
+                tar_builder.append_dir_all(path_name, src_path)?;
             } else if metadata.is_file() {
-                tar_builder.append_path_with_name(path, path)?;
+                tar_builder.append_path_with_name(src_path, path_name)?;
             }
         }
         Ok(())
@@ -216,6 +220,8 @@ COPY extractors /indexify/extractors
 
 COPY indexify.yaml indexify.yaml
 
+
+RUN pip3 install --no-input indexify_extractor_sdk
 
 
 ENV PYTHONPATH=$PTYTHONPATH:/indexify/extractors

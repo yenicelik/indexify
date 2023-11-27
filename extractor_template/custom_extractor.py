@@ -1,8 +1,8 @@
-from .base_extractor import Extractor, Content, Feature, EmbeddingSchema, ExtractorSchema
+from pydantic import BaseModel
 
 from typing import List
 
-from pydantic import BaseModel
+from indexify_extractor_sdk import Extractor, Content, Feature, EmbeddingSchema, ExtractorSchema
 
 import json
 
@@ -10,7 +10,7 @@ class InputParams(BaseModel):
     a: int = 0
     b: str = ""
 
-class MockExtractor(Extractor):
+class MyExtractor(Extractor):
     def __init__(self):
         super().__init__()
 
@@ -19,6 +19,9 @@ class MockExtractor(Extractor):
     ) -> List[List[Content]]:
         return [
             [
+                ## If the name of the embedding field in the schema is anything besides "embedding", 
+                # you must specify the name of the field in the Feature.embedding call.
+                # Feature.embedding(value=[1, 2, 3], name="my_embedding")
                 Content.from_text(
                     text="Hello World", feature=Feature.embedding(value=[1, 2, 3])
                 ),
@@ -31,10 +34,6 @@ class MockExtractor(Extractor):
                 ),
             ]
         ]
-    
-
-    def extract_query_embeddings(self, query: str) -> List[float]:
-        return [1, 2, 3]
 
     def schemas(self) -> ExtractorSchema:
         """
@@ -43,31 +42,4 @@ class MockExtractor(Extractor):
         return ExtractorSchema(
             output_schemas={"embedding": EmbeddingSchema(distance_metric="cosine", dim=3)},
             input_params=json.dumps(InputParams.model_json_schema()),
-        )
-
-
-class MockExtractorNoInputParams(Extractor):
-    def __init__(self):
-        super().__init__()
-
-    def extract(self, content: List[Content], params=None) -> List[List[Content]]:
-        return [
-            [
-                Content.from_text(
-                    text="Hello World", feature=Feature.embedding(value=[1, 2, 3])
-                ),
-                Content.from_text(
-                    text="Pipe Baz", feature=Feature.embedding(value=[1, 2, 3])
-                ),
-            ]
-        ]
-
-    @classmethod
-    def schemas(cls) -> ExtractorSchema:
-        """
-        Returns a list of options for indexing.
-        """
-        return ExtractorSchema(
-            output_schemas={"embedding": EmbeddingSchema(distance_metric="cosine", dim=3)},
-            input_params=None,
         )

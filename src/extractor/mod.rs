@@ -11,9 +11,10 @@ mod py_extractors;
 
 use py_extractors::{PyContent, PythonExtractor};
 
-use crate::{internal_api::ExtractedContent, server_config::ExtractorConfig};
+use crate::{internal_api::Content, server_config::ExtractorConfig};
 
 mod python_path;
+mod scaffold;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, FromPyObject)]
 pub struct EmbeddingSchema {
@@ -26,9 +27,9 @@ pub trait Extractor {
 
     fn extract(
         &self,
-        content: Vec<ExtractedContent>,
+        content: Vec<Content>,
         input_params: serde_json::Value,
-    ) -> Result<Vec<Vec<ExtractedContent>>, anyhow::Error>;
+    ) -> Result<Vec<Vec<Content>>, anyhow::Error>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,7 +73,7 @@ pub fn run_extractor(
     extractor_path: Option<String>,
     text: Option<String>,
     file_path: Option<String>,
-) -> Result<Vec<ExtractedContent>, anyhow::Error> {
+) -> Result<Vec<Content>, anyhow::Error> {
     let extractor_path = match extractor_path {
         Some(extractor_path) => Ok(extractor_path),
         None => {
@@ -110,4 +111,9 @@ pub fn run_extractor(
         }
         _ => Err(anyhow!("either text or file path must be provided")),
     }
+}
+
+pub fn create_extractor_template(extractor_path: &str, name: &str) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(extractor_path)?;
+    scaffold::render_extractor_templates(extractor_path, name)
 }
