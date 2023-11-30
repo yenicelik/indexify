@@ -6,7 +6,7 @@ networks:
         - subnet: 172.21.0.0/24
 services:
   indexify:
-    image: diptanu/indexify
+    image: yenicelik/indexify
     entrypoint: [ "/indexify/docker_compose_start.sh" ]
     ports:
       - 8900:8900
@@ -16,6 +16,7 @@ services:
       - INDEXIFY_DB_URL=postgres://postgres:postgres@postgres/indexify
       - INDEXIFY_COORDINATOR_ADDR=http://localhost:8950
       - INDEXIFY_INDEX_CONFIG.QDRANT_CONFIG.ADDR=http://qdrant:6334
+      - RUST_BACKTRACE=1
     depends_on:
       - qdrant
       - postgres
@@ -41,7 +42,7 @@ services:
     networks:
       server:
         ipv4_address: 172.21.0.5
-  advanced-invoice-extractor:
+  simple-invoice-extractor:
     image: yenicelik/simple-invoice-parser
     command:
       [
@@ -53,6 +54,12 @@ services:
     networks:
       server:
         ipv4_address: 172.21.0.9
+    depends_on:
+      - indexify
+    volumes:
+      - ${HOME}/.cache/huggingface/hub:/indexify/.cache/huggingface/hub
+    environment:
+      - RUST_BACKTRACE=1
 
 volumes:
   data:
